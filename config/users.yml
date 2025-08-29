@@ -1,0 +1,13 @@
+users:
+  user1:
+    hashed_password: $2b$12$W9ogUrpS64DAwtF4sz8vWe2dNFOtWTmveDufx/rziowkNc4NLjrVG
+    role: admin
+  user2:
+    hashed_password: $2b$12$D/6.8QIFz9rGxkfYpetZS.6G2lrkusLouIHzVy20VG7XAnm9jZZxu
+    role: viewer
+  victorrusu:
+    hashed_password: $2b$12$iRlmx1t22X9/bhFrMCUG6ebkDCWLJdykW8LrRyQGvPlg7o2TJDp4.
+    role: tester
+  victorrusu04:
+    hashed_password: $2b$12$iRlmx1t22X9/bhFrMCUG6ebkDCWLJdykW8LrRyQGvPlg7o2TJDp4.
+    role: admin
