@@ -1,3 +1,10 @@
+"""
+Streamlit Web Interface Module
+
+This module provides the main web application for chart QA and visualization.
+
+"""
+
 import streamlit as st
 import os
 from PIL import Image
@@ -5,23 +12,26 @@ import time
 from typing import Optional
 from dotenv import load_dotenv, find_dotenv
 import box, yaml
-
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
 import src.authentication as auth
 from src.practice2 import run_agent
 from src.chart_reconstructor import draw_chart
-from db_build import run_chart_db_build
+from src.db_build import run_chart_db_build
 from src.chart_extractor2 import parse_file
-# Load environment and config
+import shutil
+
 load_dotenv(find_dotenv())
-with open('../config/config.yml', 'r', encoding='utf8') as ymlfile:
-    cfg = box.Box(yaml.safe_load(ymlfile))
 
-
-# ---------- Helper Classes ----------
 class Timer:
+    """
+    Context manager for timing operations.
+    
+    Tracks execution time for named operations and stores metrics in a dictionary.
+    Used to measure performance of retrieval and model response operations.
+    (For tester users)
+    """
     def __init__(self):
         self.metrics = {}
     def time(self, name: str):
@@ -35,8 +45,32 @@ class Timer:
         return _T(self, name)
 
 
-# ---------- Backend Functions ----------
-def retrieve_relevant_documents(query: str, top_k: int = 1):
+def clean_extracted_images_folder(output_dir: str = "extracted_images") -> None:
+    """
+    Clean and recreate the extracted images directory.
+    
+    Args:
+        output_dir (str): Directory path to clean. Defaults to "extracted_images".
+    """
+    try:
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception as e:
+        st.warning(f"Could not clean extracted_images folder: {e}")
+
+
+def retrieve_relevant_documents(query: str, top_k: int = 1) -> list:
+    """
+    Retrieve relevant chart documents from the vector store using semantic search.
+    
+    Args:
+        query (str): Search query to find relevant charts.
+        top_k (int): Number of top results to return. Defaults to 1.
+        
+    Returns:
+        list: List of relevant documents with metadata.
+    """
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={'device': 'cpu'}
@@ -46,7 +80,19 @@ def retrieve_relevant_documents(query: str, top_k: int = 1):
     return retriever.get_relevant_documents(query)
 
 
-def process_question(question: str, role: str, timer: Timer):
+def process_question(question: str, role: str, timer: Timer) -> tuple:
+    """
+    Process a user question and generate an answer using the RAG agent.
+    
+    Args:
+        question (str): The user's question about the charts.
+        role (str): User role (tester, admin, user).
+        timer (Timer): Timer instance for tracking performance.
+        
+    Returns:
+        tuple: (answer, first_document) where answer is the agent's response
+               and first_document is the most relevant chart document.
+    """
     documents = []
     try:
         with timer.time("retrieval"):
@@ -66,7 +112,13 @@ def process_question(question: str, role: str, timer: Timer):
     return answer, first_doc
 
 
-def show_chart_image(file_path: str):
+def show_chart_image(file_path: str) -> None:
+    """
+    Display a chart image in the Streamlit interface.
+    
+    Args:
+        file_path (str): Path to the chart image file.
+    """
     if not file_path or not os.path.exists(file_path):
         st.warning("No chart image found.")
         return
@@ -77,23 +129,46 @@ def show_chart_image(file_path: str):
         st.error(f"Failed to open image: {e}")
 
 
-def draw_chart_flow(image_number: Optional[str]):
+def draw_chart_flow(image_number: Optional[str]) -> None:
+    """
+    Reconstruct and display a chart using the chart reconstructor.
+    
+    Args:
+        image_number (Optional[str]): Index of the chart to reconstruct.
+    """
     if not image_number:
         st.warning("No image number found for redrawing.")
         return
     try:
-        draw_chart(image_number)
-        img_path = 'reconstructed_charts/reconstructed_chart.png'
-        if os.path.exists(img_path):
+        result = draw_chart(image_number)
+        img_path = result.get("image_path", "reconstructed_charts/reconstructed_chart.png")
+        if img_path and os.path.exists(img_path):
             img = Image.open(img_path)
             st.image(img, caption="Reconstructed Chart", use_container_width=True)
         else:
             st.warning("Redrawn chart not found.")
+
+        if result.get("generated_code"):
+            st.info("Chart redrawn using locally generated code.")
+            st.text_area(
+                "Generated chart code",
+                result["generated_code"],
+                height=260,
+            )
+
+        if result.get("error"):
+            st.error(result["error"])
     except Exception as e:
         st.error(f"Failed to redraw chart: {e}")
 
 
-def show_tester_metrics(timer: Timer):
+def show_tester_metrics(timer: Timer) -> None:
+    """
+    Display performance metrics (for tester role).
+    
+    Args:
+        timer (Timer): Timer instance containing recorded metrics.
+    """
     if timer.metrics:
         st.subheader("Performance Metrics")
         for key, label in [
@@ -104,13 +179,15 @@ def show_tester_metrics(timer: Timer):
                 st.write(f"{label}: **{timer.metrics[key]:.2f} seconds**")
 
 
-# ---------- Streamlit Frontend ----------
-def main():
+def main() -> None:
+    """
+    Main Streamlit application entry point.
+    
+    """
     st.set_page_config(page_title="ChartSense AI", layout="wide")
     st.title("📊 Chart Sense AI")
     st.header("Intelligent Chart Analysis and Reconstruction Agent")
 
-    # ---- Session State ----
     if "role" not in st.session_state:
         st.session_state.role = None
     if "uploaded" not in st.session_state:
@@ -124,7 +201,6 @@ def main():
     if "timer" not in st.session_state:
         st.session_state.timer = Timer()
 
-    # ---- Login / Signup ----
     if st.session_state.role is None:
         st.subheader("Login or Sign Up")
         option = st.radio("Choose an option", ["Login", "Sign Up"])
@@ -151,24 +227,21 @@ def main():
 
     st.success(f"Logged in as **{st.session_state.role.upper()}**")
 
-    # ---- Upload PDF ----
     uploaded_file = st.file_uploader(
         "Upload a file to begin (PDF, DOCX, PPTX)", type=["pdf", "docx", "pptx"]
     )
 
-    # Track changes in uploaded file
     if uploaded_file is not None and not st.session_state.file_processed:
         os.makedirs("uploads", exist_ok=True)
         file_path = os.path.join("uploads", uploaded_file.name)
 
-        # Save uploaded file
         with open(file_path, "wb") as f:
             f.write(uploaded_file.read())
 
-        # Show spinner while processing / converting
         with st.spinner("Processing file, please wait..."):
             try:
-                # Call your parse_file function (handles conversion to PDF internally)
+                clean_extracted_images_folder()
+                
                 results = parse_file(file_path)
                 if results:
                     run_chart_db_build()
@@ -180,11 +253,9 @@ def main():
             except Exception as e:
                 st.error(f"Failed to process file: {e}")
 
-    # Display a message if file is already processed
     elif uploaded_file is not None and st.session_state.file_processed:
         st.success("File already processed! You can ask questions below.")
 
-    # ---- Chat Section ----
     st.subheader("💬 Chat with the Assistant")
     chat_container = st.container()
 
@@ -198,24 +269,17 @@ def main():
                 st.session_state.messages.append(("user", user_input))
                 st.session_state.messages.append(("assistant", answer or "No answer produced."))
 
-        # Display chat messages
         with chat_container:
             for sender, msg in st.session_state.messages:
                 st.chat_message(sender).write(msg)
 
-        # Show metrics if tester
         if st.session_state.role == 'tester':
             show_tester_metrics(st.session_state.timer)
     else:
         st.info("Please upload a PDF to start asking questions.")
 
-    # ---- Buttons ----
-    # [The rest of your button code remains unchanged]
-
-    # ---- Buttons ----
     st.subheader("Other Actions")
 
-    # Show Chart Image functionality
     show_chart_col1, show_chart_col2 = st.columns([1, 2])
     with show_chart_col1:
         show_chart_option = st.radio(
@@ -237,14 +301,13 @@ def main():
                         show_chart_image(first_doc.metadata.get("file_path", ""))
                     else:
                         st.warning("No matching chart found.")
-        else:  # Current chart
+        else:
             if st.button("Show Current Chart"):
                 if st.session_state.first_doc:
                     show_chart_image(st.session_state.first_doc.metadata.get("file_path", ""))
                 else:
                     st.warning("No chart available to show.")
 
-    # Draw Chart functionality (only for tester or admin)
     if st.session_state.role in ('tester', 'admin'):
         draw_chart_col1, draw_chart_col2 = st.columns([1, 2])
         with draw_chart_col1:
@@ -267,7 +330,7 @@ def main():
                             draw_chart_flow(first_doc.metadata.get("image_number", ""))
                         else:
                             st.warning("No matching chart found.")
-            else:  # Current chart
+            else:
                 if st.button("Draw Current Chart"):
                     if st.session_state.first_doc:
                         draw_chart_flow(st.session_state.first_doc.metadata.get("image_number", ""))

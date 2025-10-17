@@ -1,163 +1,135 @@
-import fitz
-import json
+"""
+Chart Extraction Module
+- extracts chart information from documents:
+ builds a JSON file with chart data of all charts found in the document.
+ this JSON file is then used to build a vector database for chart question answering
+ and to help the local LLM answer chart QAs accurately.
+"""
 
-import torch
-from PIL import Image
-import nyckel
 import base64
-from transformers import Pix2StructForConditionalGeneration,Pix2StructProcessor
+import json
+import logging
+import os
 import re
+from os.path import exists, join, abspath, splitext, basename
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
+import torch
+import fitz
+import nyckel
+from PIL import Image
+from transformers import (
+    Pix2StructForConditionalGeneration,
+    Pix2StructProcessor,
+)
 from gradio_client import Client, handle_file
-from src.data_parser import parse_table_data
 import comtypes.client
 from docx2pdf import convert
 
-def get_chart_description(image_path):
-    client = Client("ahmed-masry/ChartGemma")
-    result = client.predict(
-        image = handle_file(image_path),
-        input_text="Generate description of the figure below",
-        api_name="/predict"
-    )
-    return result
+logger = logging.getLogger(__name__)
+MIN_DRAWING_WIDTH = 50
+MIN_DRAWING_HEIGHT = 50
+MIN_DRAWING_AREA = 2500
+BBOX_PADDING = 3
+PIXMAP_SCALE = 2
+TEXT_SEARCH_PADDING = 50
+PATH_GROUPING_THRESHOLD = 30
 
-def get_chart_type(image_path):
+
+def get_chart_type(image_path: str) -> str:
+    """
+    Identify the type of chart in an image using Nyckel API.
+
+    Args:
+        image_path (str): Path to the chart image file.
+
+    Returns:
+        str: The identified chart type (e.g., "Bar Chart") or "unknown" if
+             identification fails.
+
+    Note:
+        Requires valid Nyckel API credentials.
+        Nyckel API recognizes multiple chart types. The code includes special implementations
+        for common chart types like Bar Chart, Pie Chart, Line Chart, and Scatter Plot.
+        (deterministic chart data parsing and redrawing logic is implemented separately.) 
+    """
+    nyckel_client_id = os.getenv('NYCKEL_CLIENT_ID')
+    nyckel_client_secret = os.getenv('NYCKEL_CLIENT_SECRET')
+
     try:
-        credentials = nyckel.Credentials(client_id='1v0pwr8idgcbbwgm9bgbs2c4rjnc1lsu',
-                                         client_secret='tu0i6wx3r88tw5t4iu6s0o8yjvxd4vhsnhhgwxfcddkjtj8mpiu6fzu4m1zazkyv')
+        credentials = nyckel.Credentials(
+            client_id=nyckel_client_id,
+            client_secret=nyckel_client_secret,
+        )
         with open(image_path, 'rb') as f:
             image_data = f.read()
 
         image_base64 = base64.b64encode(image_data).decode('utf-8')
         data_uri = f"data:image/png;base64,{image_base64}"
-        res = nyckel.invoke('chart-types-identifier', data_uri, credentials)
-        return res['labelName']
-    except:
+        result = nyckel.invoke('chart-types-identifier', data_uri, credentials)
+        return result.get('labelName', 'unknown')
+    except Exception as e:
+        logger.warning(f"Failed to identify chart type: {e}")
         return "unknown"
-    return "Unknown"
 
 
 
 
-def get_chart_structure(image_path):
+def get_chart_structure(image_path: str) -> str:
+    """
+    Extract the underlying data structure from a chart image.
 
+    Uses the Pix2Struct model (google/deplot) to generate a formatted
+    table representation of the chart's data. The model performs optical chart
+    recognition to convert visual charts into structured tabular data.
+
+    Args:
+        image_path (str): Path to the chart image file. Supports PNG, JPG, etc.
+
+    Returns:
+        str: A formatted table representation of the chart data, or empty string
+             if extraction fails.
+    """
     try:
         torch.set_default_device("cpu")
         processor = Pix2StructProcessor.from_pretrained('google/deplot')
         model = Pix2StructForConditionalGeneration.from_pretrained('google/deplot')
 
-        img_path = image_path
-        image = Image.open(img_path)
-        image = image.convert('RGB')
-
-        inputs = processor(images=image, text="Generate underlying data table of the figure below:", return_tensors="pt")
+        image = Image.open(image_path).convert('RGB')
+        inputs = processor(
+            images=image,
+            text="Generate underlying data table of the figure below:",
+            return_tensors="pt"
+        )
         predictions = model.generate(**inputs, max_new_tokens=512)
         result = processor.decode(predictions[0], skip_special_tokens=True)
-
-        result = result.replace('<0x0A>', "\n")
+        return result.replace('<0x0A>', "\n")
     except Exception as e:
-        print(f"Error in get_chart_structure: {e}")
-        result = ""
+        logger.error(f"Error extracting chart structure: {e}")
+        return ""
 
-    return result
 
-def parse_info_general(chart_info):
+def parse_info_for_bar_chart(chart_info: list) -> dict:
     """
-    Fixed general parser that uses the new unified data parser.
-    This replaces the buggy original implementation.
+    Parse bar chart data from structured table format.
+
+    Expects a list of pipe-delimited rows where the first column represents
+    x-axis labels and subsequent columns represent data series.
+
+    Args:
+        chart_info (list): List of pipe-delimited strings representing chart data.
+                          First row is header, subsequent rows are data points.
+
+    Returns:
+        dict: Dictionary with keys:
+            - x_labels (list): Labels for x-axis categories
+            - categories (list): Names of data series
+            - data (dict): Mapping of category names to lists of values
     """
-    # Use the new unified parser
-    parsed_data = parse_table_data(chart_info)
-
-    # Convert to the expected format for backward compatibility
-    result = {}
-    result['header'] = parsed_data.get('headers', [])
-
-    # Convert the unified data format back to the old format for compatibility
-    data_dict = {}
-    chart_data = parsed_data.get('data', {})
-    x_key = parsed_data.get('x_key')
-
-    if x_key and x_key in chart_data:
-        # Multi-series format (bar chart, line chart style)
-        x_values = chart_data[x_key]
-        for series_name, series_values in chart_data.items():
-            if series_name != x_key:
-                for i, (x_val, y_val) in enumerate(zip(x_values, series_values)):
-                    if y_val is not None:
-                        data_dict[f"{x_val}, {series_name}"] = str(y_val)
-    else:
-        # Single category format or X-Y format
-        for key, values in chart_data.items():
-            if isinstance(values, list):
-                for i, value in enumerate(values):
-                    if value is not None:
-                        data_dict[f"{key}_{i}"] = str(value)
-            else:
-                data_dict[key] = str(values)
-
-    result['data'] = data_dict
-    return result
-
-# Fixed version of the original function (for reference, but recommend using above)
-def parse_info_general_fixed(chart_info):
-    """
-    Fixed version of the original buggy function.
-    """
-    def is_header_row(row):
-        return any(all(not c.isalpha() and c not in "     " for c in cell) for cell in row)
-
-    if not chart_info or len(chart_info) == 0:
-        return {'header': [], 'data': {}}
-
-    header = chart_info[0].split("|")
-    header = [h.strip() for h in header if h.strip()]  # Clean headers
-
-    if is_header_row(header):
-        start = 0
-    else:
-        start = 1
-        if len(chart_info) > 1:
-            # Fixed: chart_info is a list, not a string with .split method
-            col1 = [chart_info[i].split('|')[0].strip() for i in range(1, len(chart_info))]
-
-            if is_header_row(col1) or (header and header[0] in "   "):
-                if header and not header[0].strip():  # Remove empty first header
-                    header = header[1:]
-
-                rows = {}
-                for i in range(len(col1)):
-                    row_parts = chart_info[i + 1].split('|')
-                    for j in range(min(len(header), len(row_parts) - 1)):
-                        key = f'{col1[i]}, {header[j]}'
-                        value = row_parts[j + 1].strip()
-                        rows[key] = value
-            else:
-                rows = {}
-                for i in range(1, len(chart_info)):
-                    row_parts = chart_info[i].split('|')
-                    for j in range(min(len(header), len(row_parts))):
-                        key = header[j]
-                        value = row_parts[j].strip()
-                        if key not in rows:
-                            rows[key] = []
-                        rows[key].append(value)
-
-    result = {}
-    result['header'] = header
-    result['data'] = rows if 'rows' in locals() else {}
-
-    return result
-
-def parse_info_for_bar_chart(chart_info):
-    result = {}
-
-    # Step 2: Get categories (car brands)
     header = chart_info[0].split('|')
-    x_key = header[0].strip()  # Usually something like "Year" or "Role"
+    x_key = header[0].strip()
     categories = [h.strip() for h in header[1:]]
 
-    # Step 3: Parse data rows
     x_labels = []
     data = {cat: [] for cat in categories}
 
@@ -168,201 +140,437 @@ def parse_info_for_bar_chart(chart_info):
 
         x_labels.append(x_label)
         for cat, val in zip(categories, values):
-            # Convert to float or None
-            if val == "-" or val == "":
-                data[cat].append(None)
-            else:
-                data[cat].append(val)
+            data[cat].append(None if val in (0, "-") else val)
 
-    # Step 4: Package into JSON structure
-    result = {
+    return {
         "x_labels": x_labels,
         "categories": categories,
-        "data": data
+        "data": data,
     }
 
-    return result
+def extract_values(values: list) -> list:
+    """
+    Clean and convert string values to floats.
 
-def extract_values(values):
-    values = [re.sub(r'[^0-9,\.]', '', val) for val in values]
-    values = [float(val) if val != '' else 0 for val in values]
-    return values
+    Removes non-numeric characters (except decimal points and commas) and
+    converts the resulting strings to floating-point numbers.
 
-def parse_info_for_pie_chart(chart_info):
-    result = {}
-    result['labels'] = [c.split('|')[0].strip() for c in chart_info]
+    Args:
+        values (list): List of string values potentially containing non-numeric
+                      characters (%, commas, special characters, etc.).
 
+    Returns:
+        list: List of float values. Non-numeric strings become 0.0.
+    """
+    cleaned = [re.sub(r'[^0-9,\.]', '', val) for val in values]
+    return [float(val) if val else 0.0 for val in cleaned]
+
+def parse_info_for_pie_chart(chart_info: list) -> dict:
+    """
+    Parse pie chart data from structured format.
+
+    Expects a list of pipe-delimited strings where each row contains a label
+    and corresponding percentage or value.
+
+    Args:
+        chart_info (list): List of pipe-delimited strings. Each row contains
+                          two pipe-separated values: label and value.
+
+    Returns:
+        dict: Dictionary with keys:
+            - labels (list): Category labels for pie slices
+            - values (list): Numeric values for each slice
+    """
+    labels = [c.split('|')[0].strip() for c in chart_info]
     values = [c.split('|')[1].strip().replace('%', "") for c in chart_info]
-    # values = [re.sub(r'[^0-9,\.]', '', val) for val in values]
-    result['values'] = extract_values(values)
+    return {
+        'labels': labels,
+        'values': extract_values(values),
+    }
 
-    return result
+def parse_info_for_scatter_chart(chart_info: list) -> dict:
+    """
+    Parse scatter plot data from structured format.
 
-def parse_info_for_scatter_chart(chart_info):
-    result = {}
+    Args:
+        chart_info (list): List of pipe-delimited strings where first row
+                          contains axis labels, and subsequent rows contain
+                          x,y coordinate pairs.
+
+    Returns:
+        dict: Dictionary with keys:
+            - x_label (str): Label for x-axis
+            - y_label (str): Label for y-axis
+            - x_values (list): List of x-coordinates
+            - y_values (list): List of y-coordinates
+    """
     labels = chart_info[0].split('|')
-    result['x_label'] = labels[0].strip()
-    result['y_label'] = labels[1].strip()
+    series = [chart_info[i].split('|') for i in range(1, len(chart_info))]
+    
+    return {
+        'x_label': labels[0].strip(),
+        'y_label': labels[1].strip(),
+        'x_values': extract_values([s[0].strip() for s in series]),
+        'y_values': extract_values([s[1].strip() for s in series]),
+    }
 
-    series = [chart_info[i].split('|') for i in range(1,len(chart_info))]
-    result['x_values'] = extract_values([s[0].strip() for s in series])
-    result['y_values'] = extract_values([s[1].strip() for s in series])
+def parse_info_for_line_chart(chart_info: list) -> dict:
+    """
+    Parse line chart data from structured format.
 
-    return result
+    Supports multiple data series. First row contains headers with first column
+    as x-axis label and remaining columns as series names.
 
-def parse_info_for_line_chart(chart_info):
-    result = {}
+    Args:
+        chart_info (list): List of pipe-delimited strings representing time series
+                          or x-y data with multiple series.
+
+    Returns:
+        dict: Dictionary with keys:
+            - x_label (str): Label for x-axis (e.g., "Year")
+            - categories (list): Names of data series
+            - x_values (list): Values for x-axis
+            - series (dict): Mapping of series names to lists of values
+    """
     categories = chart_info[0].split('|')
     x_label = categories[0].strip()
     categories = [cat.strip() for cat in categories[1:]]
-    result['x_label'] = x_label
-    result['categories'] = categories
-    series = [chart_info[i].split('|') for i in range(1,len(chart_info))]
-    result['x_values'] = [x[0].strip() for x in series]
-    result['series'] = {categories[i]: extract_values([s[i+1].strip() for s in series]) for i in range(len(categories))}
+    series = [chart_info[i].split('|') for i in range(1, len(chart_info))]
+    
+    return {
+        'x_label': x_label,
+        'categories': categories,
+        'x_values': [x[0].strip() for x in series],
+        'series': {
+            categories[i]: extract_values([s[i+1].strip() for s in series])
+            for i in range(len(categories))
+        },
+    }
 
-    return result
+
+CHART_PARSERS = {
+    'Pie Chart': parse_info_for_pie_chart,
+    'Bar Chart': parse_info_for_bar_chart,
+    'Scatter Plot': parse_info_for_scatter_chart,
+    'Line Chart': parse_info_for_line_chart,
+}
 
 
-def get_chart_info(image_path, nearby_text=""):
-    chart_info = {}
+def get_chart_info(image_path: str, nearby_text: str = "") -> dict:
+    """
+    Extract and parse comprehensive chart information from an image.
+
+    This is the main entry point for chart analysis. It orchestrates the
+    following steps:
+    1. Extract chart data table using Pix2Struct model
+    2. Identify chart type using Nyckel API
+    3. Extract title
+    4. Parse data according to chart type
+    5. Compile results with metadata
+
+    Args:
+        image_path (str): Path to the chart image file.
+        nearby_text (str, optional): Text appearing near the chart in the document.
+                                    Defaults to empty string.
+
+    Returns:
+        dict: Comprehensive chart information containing:
+            - data_table (list): Raw table rows
+            - file_path (str): Original image path
+            - chart_type (str): Identified chart type
+            - nearby_text (str): Context text
+            - chart_title (str): Extracted title or "unavailable"
+            - Type-specific fields (x_labels, categories, data, etc.)
+    """
     chart_structure = get_chart_structure(image_path)
-    chart_structure = chart_structure.split('\n')
+    chart_lines = chart_structure.split('\n')
 
-    chart_info['data_table'] = chart_structure
-    chart_info['file_path'] = image_path
-    chart_info['chart_type'] = get_chart_type(image_path)
-    chart_info['nearby_text'] = nearby_text
+    chart_info = {
+        'data_table': chart_lines,
+        'file_path': image_path,
+        'chart_type': get_chart_type(image_path),
+        'nearby_text': nearby_text,
+    }
 
     try:
-        chart_info['chart_title'] = chart_structure[0].split('|')[1].strip()
+        chart_info['chart_title'] = chart_lines[0].split('|')[1].strip()
     except (IndexError, AttributeError):
         chart_info['chart_title'] = "unavailable"
 
     try:
-        if chart_info['chart_type'] == 'Pie Chart':
-            chart_info.update(parse_info_for_pie_chart(chart_structure[1:]))
-        elif chart_info['chart_type'] == 'Bar Chart':
-            chart_info.update(parse_info_for_bar_chart(chart_structure[1:]))
-        elif chart_info['chart_type'] == 'Scatter Plot':
-            chart_info.update(parse_info_for_scatter_chart(chart_structure[1:]))
-        elif chart_info['chart_type'] == 'Line Chart':
-            chart_info.update(parse_info_for_line_chart(chart_structure[1:]))
-        else:
-            chart_info.update(parse_info_general_fixed(chart_structure[1:]))
-    except:
-        print("Something went wrong when parsing chart info")
-        return chart_info
+        chart_type = chart_info['chart_type']
+        if chart_type in CHART_PARSERS and len(chart_lines) > 1:
+            parser = CHART_PARSERS[chart_type]
+            chart_info.update(parser(chart_lines[1:]))
+    except Exception as e:
+        logger.error(f"Error parsing chart info: {e}")
 
     return chart_info
 
-def get_empty_text_info():
-    """Return empty text info structure"""
-    return {
-        "title": "unavailable",
-        "full_text": "unavailable",
-    }
 
+def extract_vectorial_drawings(page, output_dir: str, page_number: int, global_counter: int, existing_image_bboxes: list = None) -> list:
+    """
+    Extract all vectorial drawings from a PDF page, excluding those that overlap with embedded images.
+    Vectorial drawings: Charts created when (example) Word converts to PDF and chart was inserted into 
+    Word from Excel.
+    Embedded images: Charts inserted as images in the document (word/pdf).
 
-def extract_vectorial_drawings(page, output_dir, page_number, global_counter):
-    """Extract only the first/largest vectorial drawing from the page"""
+    The algorithm groups nearby paths together to avoid fragmenting a single chart
+    into multiple parts (e.g., treating individual bar segments or axis lines as
+    separate images). Each identified chart is treated as one unified drawing.
+
+    Duplicate Detection:
+        When charts are inserted from Excel into Word then converted to PDF, they
+        appear as both embedded images AND vectorial drawings. This function skips
+        any vectorial drawing that overlaps with an already-extracted image to
+        prevent duplicate chart extraction.
+        
+        Additionally, multiple vectorial representations of the same chart are
+        deduplicated by comparing bounding boxes and keeping only the first one.
+
+    Args:
+        page: PyMuPDF page object.
+        output_dir (str): Directory to save extracted drawing images.
+        page_number (int): Index of the page being processed (0-based).
+        global_counter (int): Global image counter for naming consistency.
+        existing_image_bboxes (list): List of bounding boxes of already-extracted images.
+                                     Defaults to empty list if None.
+
+    Returns:
+        list: List of chart info dicts for all extracted vectorial drawings.
+              Multiple drawings on the same page are all extracted (not just largest).
+    """
+    if existing_image_bboxes is None:
+        existing_image_bboxes = []
+
     drawings = []
-
-    # Get all drawings (paths, lines, shapes) from the page
     paths = page.get_drawings()
 
-    if paths:
-        # Group nearby paths to identify complete drawings
-        drawing_groups = group_nearby_paths(paths)
+    if not paths:
+        return drawings
 
-        # Filter groups by size and select the largest one
-        valid_groups = []
-        for group in drawing_groups:
-            bbox = calculate_group_bbox(group)
-            if bbox:
-                width = bbox[2] - bbox[0]
-                height = bbox[3] - bbox[1]
-                area = width * height
+    drawing_groups = group_nearby_paths(paths)
+    valid_groups = []
 
-                # Only consider drawings with meaningful size
-                if width > 50 and height > 50 and area > 2500:
-                    valid_groups.append((group, bbox, area))
+    for group in drawing_groups:
+        bbox = calculate_group_bbox(group)
+        if not bbox:
+            continue
 
-        if valid_groups:
-            # Sort by area (largest first) and take only the first one
-            valid_groups.sort(key=lambda x: x[2], reverse=True)
-            path_group, bbox, area = valid_groups[0]
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        area = width * height
 
-            # Expand bbox with minimal padding for context
-            expanded_bbox = fitz.Rect(
-                max(0, bbox[0] - 3),
-                max(0, bbox[1] - 3),
-                min(page.rect.width, bbox[2] + 3),
-                min(page.rect.height, bbox[3] + 3)
-            )
+        if width > MIN_DRAWING_WIDTH and height > MIN_DRAWING_HEIGHT and area > MIN_DRAWING_AREA:
+            valid_groups.append((group, bbox, area))
 
-            # Render this region as image
-            mat = fitz.Matrix(2, 2)  # 2x scale for better quality
-            pix = page.get_pixmap(matrix=mat, clip=expanded_bbox)
+    if not valid_groups:
+        return drawings
 
-            # Save the drawing as image
-            drawing_filename = f"page_{page_number + 1}_drawing_1.png"
-            drawing_path = os.path.join(output_dir, drawing_filename)
-            pix.save(drawing_path)
+    # Deduplicate drawings on the same page by bbox similarity
+    deduplicated_groups = _deduplicate_drawing_bboxes(valid_groups)
 
-            # Extract nearby text - exclude text inside the drawing area
-            nearby_text = extract_text_outside_area(page, bbox)
+    for drawing_index, (_, bbox, _) in enumerate(deduplicated_groups, 1):
+        if _drawing_overlaps_with_image(bbox, existing_image_bboxes):
+            logger.debug(f"Skipping vectorial drawing on page {page_number + 1} (overlaps with embedded image)")
+            continue
 
-            # Use get_chart_info function instead of manual JSON building
-            chart_info = get_chart_info(drawing_path, nearby_text)
+        expanded_bbox = fitz.Rect(
+            max(0, bbox[0] - BBOX_PADDING),
+            max(0, bbox[1] - BBOX_PADDING),
+            min(page.rect.width, bbox[2] + BBOX_PADDING),
+            min(page.rect.height, bbox[3] + BBOX_PADDING),
+        )
 
-            # Add metadata specific to vectorial drawings using global counter
-            chart_info.update({
-                "page_number": page_number + 1,
-                "image_number": global_counter,
-            })
+        mat = fitz.Matrix(PIXMAP_SCALE, PIXMAP_SCALE)
+        pix = page.get_pixmap(matrix=mat, clip=expanded_bbox)
 
-            drawings.append(chart_info)
+        drawing_filename = f"page_{page_number + 1}_drawing_{drawing_index}.png"
+        drawing_path = join(output_dir, drawing_filename)
+        pix.save(drawing_path)
+        pix = None
 
-            pix = None  # Free memory
+        nearby_text = extract_text_outside_area(page, bbox)
+        chart_info = get_chart_info(drawing_path, nearby_text)
+        chart_info.update({
+            "page_number": page_number + 1,
+            "image_number": global_counter + drawing_index - 1,
+        })
+        drawings.append(chart_info)
 
     return drawings
 
 
-def extract_text_outside_area(page, drawing_bbox, padding=50):
-    """Extract text near the drawing but not inside it"""
-    # Create expanded area for text search
+def _deduplicate_drawing_bboxes(valid_groups: list, bbox_similarity_threshold: float = 0.95) -> list:
+    """
+    Deduplicate vectorial drawings that are likely the same visual element.
+
+    When PDF rendering creates multiple paths for the same visual object
+    (e.g., different rendering passes or layers), this function detects and
+    removes near-duplicate bounding boxes.
+
+    Args:
+        valid_groups (list): List of (group, bbox, area) tuples.
+        bbox_similarity_threshold (float): IoU threshold for considering bboxes
+                                         as duplicates. Defaults to 0.95 (95%
+                                         overlap indicates same object).
+
+    Returns:
+        list: Deduplicated list of (group, bbox, area) tuples.
+    """
+    if len(valid_groups) <= 1:
+        return valid_groups
+
+    deduplicated = []
+    used_indices = set()
+
+    for i, (group_i, bbox_i, area_i) in enumerate(valid_groups):
+        if i in used_indices:
+            continue
+
+        # Check if this bbox is a duplicate of any already-kept bbox
+        is_duplicate = False
+        for group_k, bbox_k, area_k in deduplicated:
+            iou = _calculate_iou(bbox_i, bbox_k)
+            if iou >= bbox_similarity_threshold:
+                is_duplicate = True
+                logger.debug(f"Skipping duplicate vectorial drawing (IoU: {iou:.2f})")
+                break
+
+        if not is_duplicate:
+            deduplicated.append((group_i, bbox_i, area_i))
+        else:
+            used_indices.add(i)
+
+    return deduplicated
+
+
+def _calculate_iou(bbox1: tuple, bbox2: tuple) -> float:
+    """
+    Calculate Intersection-over-Union (IoU) between two bounding boxes.
+
+    Args:
+        bbox1 (tuple): First bbox as (x0, y0, x1, y1).
+        bbox2 (tuple): Second bbox as (x0, y0, x1, y1).
+
+    Returns:
+        float: IoU ratio between 0 and 1. Returns 0 if boxes don't intersect.
+    """
+    x0_1, y0_1, x1_1, y1_1 = bbox1
+    x0_2, y0_2, x1_2, y1_2 = bbox2
+
+    inter_x0 = max(x0_1, x0_2)
+    inter_y0 = max(y0_1, y0_2)
+    inter_x1 = min(x1_1, x1_2)
+    inter_y1 = min(y1_1, y1_2)
+
+    if inter_x0 < inter_x1 and inter_y0 < inter_y1:
+        intersection_area = (inter_x1 - inter_x0) * (inter_y1 - inter_y0)
+    else:
+        return 0.0
+
+    area1 = (x1_1 - x0_1) * (y1_1 - y0_1)
+    area2 = (x1_2 - x0_2) * (y1_2 - y0_2)
+    union_area = area1 + area2 - intersection_area
+
+    return intersection_area / union_area if union_area > 0 else 0.0
+
+
+def _drawing_overlaps_with_image(drawing_bbox: tuple, image_bboxes: list, overlap_threshold: float = 0.7) -> bool:
+    """
+    Check if a vectorial drawing overlaps with any embedded image.
+
+    Uses intersection-over-union (IoU) ratio to detect significant overlaps,
+    which indicates the drawing is likely the same object as the embedded image.
+
+    Args:
+        drawing_bbox (tuple): Drawing bounding box as (x0, y0, x1, y1).
+        image_bboxes (list): List of image bounding boxes.
+        overlap_threshold (float): Minimum IoU ratio to consider as overlap.
+                                 Defaults to 0.7 (70% overlap required).
+
+    Returns:
+        bool: True if drawing significantly overlaps with any image.
+    """
+    if not image_bboxes:
+        return False
+
+    dx0, dy0, dx1, dy1 = drawing_bbox
+
+    for img_bbox in image_bboxes:
+        ix0, iy0, ix1, iy1 = img_bbox
+
+        inter_x0 = max(dx0, ix0)
+        inter_y0 = max(dy0, iy0)
+        inter_x1 = min(dx1, ix1)
+        inter_y1 = min(dy1, iy1)
+
+        if inter_x0 < inter_x1 and inter_y0 < inter_y1:
+            intersection_area = (inter_x1 - inter_x0) * (inter_y1 - inter_y0)
+            drawing_area = (dx1 - dx0) * (dy1 - dy0)
+            image_area = (ix1 - ix0) * (iy1 - iy0)
+
+            union_area = drawing_area + image_area - intersection_area
+            iou = intersection_area / union_area if union_area > 0 else 0
+
+            if iou >= overlap_threshold:
+                return True
+
+    return False
+
+
+def extract_text_outside_area(page, drawing_bbox: tuple, padding: int = 50) -> str:
+    """
+    Extract text near a drawing but not overlapping with it.
+    Gives more context about the chart from surrounding text.
+
+    Args:
+        page: PyMuPDF page object.
+        drawing_bbox (tuple): Bounding box of drawing as (x0, y0, x1, y1).
+        padding (int): Pixels to expand search area beyond drawing bbox.
+                      Defaults to 50.
+
+    Returns:
+        str: Concatenated text found in search area but outside drawing bbox.
+    """
     search_area = fitz.Rect(
         max(0, drawing_bbox[0] - padding),
         max(0, drawing_bbox[1] - padding),
         min(page.rect.width, drawing_bbox[2] + padding),
-        min(page.rect.height, drawing_bbox[3] + padding)
+        min(page.rect.height, drawing_bbox[3] + padding),
     )
 
-    # Get all text blocks in the search area
     text_blocks = page.get_text("dict", clip=search_area)
-
     nearby_text_parts = []
-    drawing_rect = fitz.Rect(drawing_bbox[0], drawing_bbox[1], drawing_bbox[2], drawing_bbox[3])
+    drawing_rect = fitz.Rect(*drawing_bbox)
 
-    # Filter out text that overlaps with the drawing area
     for block in text_blocks.get("blocks", []):
-        if "lines" in block:
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    span_rect = fitz.Rect(span["bbox"])
-
-                    # Only include text that doesn't overlap with the drawing
-                    if not span_rect.intersects(drawing_rect):
-                        text = span["text"].strip()
-                        if text:
-                            nearby_text_parts.append(text)
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                span_rect = fitz.Rect(span["bbox"])
+                if not span_rect.intersects(drawing_rect):
+                    text = span["text"].strip()
+                    if text:
+                        nearby_text_parts.append(text)
 
     return " ".join(nearby_text_parts).strip()
 
 
-def group_nearby_paths(paths, distance_threshold=30):
-    """Group paths that are close together to form complete drawings"""
+def group_nearby_paths(paths: list, distance_threshold: float = 30) -> list:
+    """
+    Group paths that are close together to form complete drawings.
+    Avoids fragmenting single charts into multiple parts.
+
+    Args:
+        paths (list): List of PyMuPDF path objects.
+        distance_threshold (float): Maximum distance between path centers for
+                                   grouping. Defaults to 30 points.
+
+    Returns:
+        list: List of path groups, where each group is a list of paths.
+    """
     if not paths:
         return []
 
@@ -373,12 +581,10 @@ def group_nearby_paths(paths, distance_threshold=30):
         if i in used_paths:
             continue
 
-        # Start a new group
         current_group = [path]
         used_paths.add(i)
-
-        # Find nearby paths
         path_bbox = calculate_path_bbox(path)
+        
         if not path_bbox:
             continue
 
@@ -387,280 +593,319 @@ def group_nearby_paths(paths, distance_threshold=30):
                 continue
 
             other_bbox = calculate_path_bbox(other_path)
-            if not other_bbox:
+            if not other_bbox or not paths_are_nearby(path_bbox, other_bbox, distance_threshold):
                 continue
 
-            # Check if paths are close enough
-            if paths_are_nearby(path_bbox, other_bbox, distance_threshold):
-                current_group.append(other_path)
-                used_paths.add(j)
+            current_group.append(other_path)
+            used_paths.add(j)
 
-        if current_group:
-            groups.append(current_group)
+        groups.append(current_group)
 
     return groups
 
 
-def calculate_path_bbox(path):
-    """Calculate bounding box for a single path"""
+def calculate_path_bbox(path: dict) -> tuple | None:
+    """
+    Calculate bounding box for a single PDF path.
+
+    Handles both simple rect paths and complex paths with multiple items.
+
+    Args:
+        path (dict): PyMuPDF path dictionary containing 'rect' or 'items'.
+
+    Returns:
+        tuple: Bounding box as (x0, y0, x1, y1), or None if bbox cannot be calculated.
+    """
     try:
         if 'rect' in path:
             rect = path['rect']
             return (rect.x0, rect.y0, rect.x1, rect.y1)
-        elif 'items' in path:
+        if 'items' in path:
             all_points = []
             for item in path['items']:
-                if item[0] in ['l', 'm', 'c']:  # line, move, curve
+                if item[0] in ['l', 'm', 'c']:
                     all_points.extend(item[1:])
 
             if all_points:
                 x_coords = [p.x if hasattr(p, 'x') else p[0] for p in all_points]
                 y_coords = [p.y if hasattr(p, 'y') else p[1] for p in all_points]
                 return (min(x_coords), min(y_coords), max(x_coords), max(y_coords))
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Error calculating path bbox: {e}")
     return None
 
 
-def calculate_group_bbox(path_group):
-    """Calculate combined bounding box for a group of paths"""
-    bboxes = [calculate_path_bbox(path) for path in path_group]
-    bboxes = [bbox for bbox in bboxes if bbox]
+def calculate_group_bbox(path_group: list) -> tuple | None:
+    """
+    Calculate combined bounding box for a group of paths.
+
+    Finds the minimum bounding rectangle that contains all paths in the group.
+
+    Args:
+        path_group (list): List of path objects or dictionaries.
+
+    Returns:
+        tuple: Combined bounding box as (x0, y0, x1, y1), or None if group is empty.
+    """
+    bboxes = [bbox for bbox in (calculate_path_bbox(path) for path in path_group) if bbox]
 
     if not bboxes:
         return None
 
-    min_x = min(bbox[0] for bbox in bboxes)
-    min_y = min(bbox[1] for bbox in bboxes)
-    max_x = max(bbox[2] for bbox in bboxes)
-    max_y = max(bbox[3] for bbox in bboxes)
+    return (
+        min(bbox[0] for bbox in bboxes),
+        min(bbox[1] for bbox in bboxes),
+        max(bbox[2] for bbox in bboxes),
+        max(bbox[3] for bbox in bboxes),
+    )
 
-    return (min_x, min_y, max_x, max_y)
 
+def paths_are_nearby(bbox1: tuple, bbox2: tuple, threshold: float) -> bool:
+    """
+    Check if two bounding boxes are within threshold distance.
 
-def paths_are_nearby(bbox1, bbox2, threshold):
-    """Check if two bounding boxes are within threshold distance"""
-    # Calculate distance between box centers
+    Calculates Euclidean distance between bbox centers.
+
+    Args:
+        bbox1 (tuple): First bounding box as (x0, y0, x1, y1).
+        bbox2 (tuple): Second bounding box as (x0, y0, x1, y1).
+        threshold (float): Maximum distance for proximity.
+
+    Returns:
+        bool: True if distance > 0 and distance <= threshold.
+    """
     center1_x = (bbox1[0] + bbox1[2]) / 2
     center1_y = (bbox1[1] + bbox1[3]) / 2
     center2_x = (bbox2[0] + bbox2[2]) / 2
     center2_y = (bbox2[1] + bbox2[3]) / 2
 
     distance = ((center1_x - center2_x) ** 2 + (center1_y - center2_y) ** 2) ** 0.5
-    return distance <= threshold and distance != 0
+    return 0 < distance <= threshold
 
 
-def get_image_regions(pdf_path, output_dir="extracted_images"):
-    """Extract all embedded images and the first vectorial drawing from PDF"""
-    # Create output directory
-    Path(output_dir).mkdir(exist_ok=True)
-    print("Processing PDF")
+def save_extraction_results(results: list, output_dir: str) -> None:
+    """
+    Save extraction results to JSON file.
 
-    pdf_doc = fitz.open(pdf_path)
-    results = []
-    global_image_counter = 0  # Global counter for all images and drawings
+    Args:
+        results (list): List of chart information dictionaries.
+        output_dir (str): Directory to save the results file.
 
-    for page_number in range(len(pdf_doc)):
-        page = pdf_doc[page_number]
-
-        # Extract embedded images
-        image_list = page.get_images(full=True)
-        for img_index, img in enumerate(image_list):
-            xref = img[0]
-
-            try:
-                # Extract image data from PDF
-                base_image = pdf_doc.extract_image(xref)
-                image_bytes = base_image["image"]
-                image_ext = base_image["ext"]
-
-                # Increment global counter
-                global_image_counter += 1
-
-                # Save image with appropriate extension using global counter
-                img_filename = f"page_{page_number + 1}_image_{global_image_counter}.{image_ext}"
-                img_path = os.path.join(output_dir, img_filename)
-
-                with open(img_path, "wb") as img_file:
-                    img_file.write(image_bytes)
-
-                # Get image rectangle on page
-                img_rects = page.get_image_rects(xref)
-                if img_rects:
-                    rect = img_rects[0]
-
-                    # Convert rect to bbox format for consistency with vectorial drawings
-                    bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
-
-                    # Extract nearby text - exclude text inside the image area (same logic as vectorial drawings)
-                    nearby_text = extract_text_outside_area(page, bbox)
-
-                    # Use get_chart_info function instead of manual JSON building
-                    chart_info = get_chart_info(img_path, nearby_text)
-
-                    # Add metadata specific to embedded images using global counter
-                    chart_info.update({
-                        "page_number": page_number + 1,
-                        "image_number": global_image_counter,
-                    })
-
-                    results.append(chart_info)
-
-            except Exception as e:
-                print(f"Error extracting image {img_index + 1} from page {page_number + 1}: {e}")
-                continue
-
-        # Extract only the first/largest vectorial drawing
-        try:
-            drawings = extract_vectorial_drawings(page, output_dir, page_number, global_image_counter + 1)
-            results.extend(drawings)
-            # Update global counter if drawings were found
-            if drawings:
-                global_image_counter += len(drawings)
-        except Exception as e:
-            print(f"Error extracting drawings from page {page_number + 1}: {e}")
-
-    pdf_doc.close()
-
-    # Save JSON file
-    json_path = os.path.join(output_dir, "extraction_results.json")
+    Saves to: <output_dir>/extraction_results.json
+    """
+    json_path = join(output_dir, "extraction_results.json")
     with open(json_path, "w", encoding="utf-8") as json_file:
         json.dump(results, json_file, indent=2, ensure_ascii=False)
 
+
+def get_image_regions(pdf_path: str, output_dir: str = "extracted_images") -> list:
+    """
+    Extract all embedded images and vectorial drawings from a PDF.
+
+    This is the main extraction function that processes an entire PDF and
+    returns a list of all discovered charts.
+
+    Args:
+        pdf_path (str): Path to the PDF file to process.
+        output_dir (str): Directory to save extracted images and results JSON.
+                         Defaults to "extracted_images".
+
+    Returns:
+        list: List of chart information dictionaries, one per extracted chart.
+              Each dict contains chart data, type, title, and metadata.
+
+    Saves:
+        - Individual chart images to <output_dir>/page_X_image_Y.{ext}
+        - Chart extraction results to <output_dir>/extraction_results.json
+    """
+    Path(output_dir).mkdir(exist_ok=True)
+    logger.info("Processing PDF")
+
+    pdf_doc = fitz.open(pdf_path)
+    results = []
+    global_image_counter = 0
+    image_bboxes = []
+
+    try:
+        for page_number in range(len(pdf_doc)):
+            page = pdf_doc[page_number]
+
+            image_list = page.get_images(full=True)
+            for img_index, img in enumerate(image_list):
+                try:
+                    xref = img[0]
+                    global_image_counter += 1
+                    img_path = extract_image_from_pdf(
+                        pdf_doc, xref, page_number, output_dir, global_image_counter
+                    )
+
+                    img_rects = page.get_image_rects(xref)
+                    if img_rects:
+                        bbox = (img_rects[0].x0, img_rects[0].y0, img_rects[0].x1, img_rects[0].y1)
+                        image_bboxes.append(bbox)
+                        nearby_text = extract_text_outside_area(page, bbox)
+                        chart_info = get_chart_info(img_path, nearby_text)
+                        chart_info.update({
+                            "page_number": page_number + 1,
+                            "image_number": global_image_counter,
+                        })
+                        results.append(chart_info)
+                except Exception as e:
+                    logger.error(f"Error extracting image {img_index + 1} from page {page_number + 1}: {e}")
+
+            try:
+                drawings = extract_vectorial_drawings(page, output_dir, page_number, global_image_counter, image_bboxes)
+                results.extend(drawings)
+                if drawings:
+                    global_image_counter += len(drawings)
+            except Exception as e:
+                logger.error(f"Error extracting drawings from page {page_number + 1}: {e}")
+    finally:
+        pdf_doc.close()
+
+    save_extraction_results(results, output_dir)
     return results
 
-def convert_docx_to_pdf(input_path, output_path):
-    """Convert a .docx file to PDF using Microsoft Word COM API"""
+
+def extract_image_from_pdf(pdf_doc, xref: int, page_number: int, output_dir: str, global_counter: int) -> str:
+    """
+    Extract a single image from a PDF by reference.
+
+    Args:
+        pdf_doc: PyMuPDF PDF document object.
+        xref (int): Cross-reference number of the image in the PDF.
+        page_number (int): Page index (0-based).
+        output_dir (str): Directory to save extracted image.
+        global_counter (int): Global image counter for consistent naming.
+
+    Returns:
+        str: Path to the saved image file.
+    """
+    base_image = pdf_doc.extract_image(xref)
+    image_bytes = base_image["image"]
+    image_ext = base_image["ext"]
+
+    img_filename = f"page_{page_number + 1}_image_{global_counter}.{image_ext}"
+    img_path = join(output_dir, img_filename)
+
+    with open(img_path, "wb") as img_file:
+        img_file.write(image_bytes)
+
+    return img_path
+
+def ensure_pdf_extension(output_path: str) -> str:
+    """
+    Ensure output path has .pdf extension.
+
+    Args:
+        output_path (str): File path that may or may not have .pdf extension.
+
+    Returns:
+        str: Path with .pdf extension appended if needed.
+    """
+    if output_path.lower().endswith('.pdf'):
+        return output_path
+    return splitext(output_path)[0] + '.pdf'
+
+
+def convert_word_to_pdf(file_path: str, output_path: str) -> str | None:
+    """
+    Convert a .docx file to PDF using docx2pdf library.
+
+    Args:
+        file_path (str): Path to .docx file to convert.
+        output_path (str): Output path for PDF file (extension auto-added if needed).
+
+    Returns:
+        str | None: Path to created PDF file, or None if conversion fails.
+    """
     try:
-        word = comtypes.client.CreateObject('Word.Application')
-        word.Visible = False
-        doc = word.Documents.Open(os.path.abspath(input_path))
-        doc.SaveAs(os.path.abspath(output_path), FileFormat=17)  # 17 = wdFormatPDF
-        doc.Close()
-        word.Quit()
-        return True
-    except Exception as e:
-        print(f"Error converting .docx to PDF: {e}")
-        return False
-    finally:
-        if 'word' in locals():
-            word.Quit()
-
-
-def convert_word_to_pdf(file_path, output_path):
-    """Convert a .docx file to PDF using docx2pdf library"""
-    try:
-        # Check if output_path has .pdf extension, if not add it
-        if not output_path.lower().endswith('.pdf'):
-            output_path = os.path.splitext(output_path)[0] + '.pdf'
-
-        # Convert the document
+        output_path = ensure_pdf_extension(output_path)
         convert(file_path, output_path)
 
-        # Verify the PDF was created
-        if os.path.exists(output_path):
+        if exists(output_path):
             return output_path
-        else:
-            print(f"PDF conversion completed but file not found at: {output_path}")
-            return None
+        logger.error(f"PDF conversion completed but file not found at: {output_path}")
+        return None
     except Exception as e:
-        print(f"Error converting .docx to PDF using docx2pdf: {e}")
+        logger.error(f"Error converting .docx to PDF: {e}")
         return None
 
-def convert_pptx_to_pdf(input_path, output_path):
-    """Convert a .pptx file to PDF using Microsoft PowerPoint COM API"""
-    try:
-        powerpoint = comtypes.client.CreateObject('PowerPoint.Application')
-        powerpoint.Visible = False
-        presentation = powerpoint.Presentations.Open(os.path.abspath(input_path))
-        presentation.SaveAs(os.path.abspath(output_path), FileFormat=32)  # 32 = ppSaveAsPDF
-        presentation.Close()
-        powerpoint.Quit()
-        return True
-    except Exception as e:
-        print(f"Error converting .pptx to PDF: {e}")
-        return False
-    finally:
-        if 'powerpoint' in locals():
-            powerpoint.Quit()
 
+def convert_to_pdf_if_needed(file_path: str, temp_dir: str = "temp_pdf") -> str:
+    """
+    Convert document files to PDF if needed.
 
-from pathlib import Path
-import os
+    Automatically converts .docx files to PDF format. Returns
+    PDF path unchanged if file is already in PDF format.
 
+    Args:
+        file_path (str): Path to document file (.pdf, .docx, or .pptx).
+        temp_dir (str): Temporary directory for converted files.
+                       Defaults to "temp_pdf".
 
-def convert_to_pdf_if_needed(file_path, temp_dir="temp_pdf"):
-    """Convert .docx or .pptx to PDF if needed, return path to PDF file"""
+    Returns:
+        str: Path to PDF file (original or converted).
+
+    Raises:
+        ValueError: If file format is unsupported or conversion fails.
+    """
     Path(temp_dir).mkdir(exist_ok=True)
-    file_ext = os.path.splitext(file_path)[1].lower()
+    file_ext = splitext(file_path)[1].lower()
 
-    if file_ext in ['.docx', '.pptx']:
-        temp_pdf_path = os.path.join(temp_dir, f"converted_{os.path.splitext(os.path.basename(file_path))[0]}.pdf")
-
-        try:
-            if file_ext == '.docx':
-                # docx2pdf returns path; LibreOffice version may also return path
-                pdf_path = convert_word_to_pdf(file_path, file_path)
-            # else:  # .pptx
-            #     pdf_path = convert_pptx_to_pdf(file_path, temp_pdf_path)
-
-            if pdf_path and os.path.exists(pdf_path):
-                return pdf_path
-            else:
-                raise ValueError(f"Conversion failed: {file_ext} → PDF")
-        except Exception as e:
-            raise ValueError(f"Error converting {file_ext} to PDF: {e}")
-
-    elif file_ext == '.pdf':
+    if file_ext == '.pdf':
         return file_path
-    else:
+
+    if file_ext not in ['.docx', '.pptx']:
         raise ValueError(f"Unsupported file extension: {file_ext}")
 
-
-def parse_file(file_path):
-    if os.path.exists(file_path):
-        try:
-            pdf_path = convert_to_pdf_if_needed(file_path)
-            results = get_image_regions(pdf_path)
-            # Clean up temporary PDF if it was created
-            if file_path != pdf_path:
-                try:
-                    os.remove(pdf_path)
-                except:
-                    pass
-            return results
-        except Exception as e:
-            print(f"Error processing file {file_path}: {e}")
-            return []
+    if file_ext == '.docx':
+        pdf_path = convert_word_to_pdf(file_path, file_path)
     else:
-        print(f"File not found: {file_path}")
+        raise ValueError(f"PPTX conversion not yet implemented")
+
+    if not (pdf_path and exists(pdf_path)):
+        raise ValueError(f"Conversion failed: {file_ext} → PDF")
+
+    return pdf_path
+
+
+def parse_file(file_path: str) -> list:
+    """
+    Parse file and extract all chart information.
+
+    Main entry point for file processing. Handles format conversion,
+    PDF extraction, and cleanup.
+
+    Args:
+        file_path (str): Path to document file (.pdf, .docx).
+
+    Returns:
+        list: List of chart information dictionaries. Empty list if file
+              not found or processing fails.
+
+    Processing Steps:
+        1. Validate file exists
+        2. Convert to PDF if needed
+        3. Extract charts from PDF
+        4. Clean up temporary files
+        5. Return results
+    """
+    if not exists(file_path):
+        logger.error(f"File not found: {file_path}")
         return []
 
-def main():
-    pdf_path = "../sample_data/test_pt_demo(7).pdf"
+    try:
+        pdf_path = convert_to_pdf_if_needed(file_path)
+        results = get_image_regions(pdf_path)
 
-    if os.path.exists(pdf_path):
-        results = parse_file(pdf_path)
+        if file_path != pdf_path:
+            try:
+                os.remove(pdf_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove temporary PDF: {e}")
 
-        # Separate results by type
-        embedded_images = [r for r in results if r.get("type") == "embedded_image"]
-        vectorial_drawings = [r for r in results if r.get("type") == "vectorial_drawing"]
-
-        print(f"Extracted {len(embedded_images)} embedded images")
-        print(f"Extracted {len(vectorial_drawings)} vectorial drawings (first/largest only)")
-        print("Results saved in 'extracted_images' directory")
-    # results = get_chart_info("chart_images_test/line-chart-example2.png")
-    # output_dir = "extracted_images"
-    # json_path = os.path.join(output_dir, "extraction_results.json")
-    # with open(json_path, "w", encoding="utf-8") as json_file:
-    #     json.dump(results, json_file, indent=2, ensure_ascii=False)
-
-
-
-
-
-
-
-
-if __name__ == "__main__":
-    main()
+        return results
+    except Exception as e:
+        logger.error(f"Error processing file {file_path}: {e}")
+        return []

@@ -5,6 +5,9 @@ users:
   user2:
     hashed_password: $2b$12$D/6.8QIFz9rGxkfYpetZS.6G2lrkusLouIHzVy20VG7XAnm9jZZxu
     role: viewer
+  vic:
+    hashed_password: $2b$12$.lVvQ.jQKU0i0gW4YWBYqeRbhBouX.KKMJSeTB6YI2fwPof8ToGdG
+    role: tester
   victorrusu:
     hashed_password: $2b$12$iRlmx1t22X9/bhFrMCUG6ebkDCWLJdykW8LrRyQGvPlg7o2TJDp4.
     role: tester
