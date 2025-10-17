@@ -19,13 +19,13 @@
 
 ## Features
 
-- **📄 Multi-format Document Support**: Extract charts from PDF, DOCX, and PPTX files
-- **🎨 Multi-chart Type Support**: Handle Bar, Pie, Scatter, and Line charts
-- **🔍 Semantic Search**: Retrieve relevant charts using natural language queries via RAG
-- **🤖 Agentic Q&A**: Answer questions about chart data using ReAct reasoning pattern
-- **📊 Chart Reconstruction**: Regenerate charts from extracted data with LLM-powered fallback
-- **👥 Role-Based Access**: Support for user, tester, and admin roles
-- **📈 Performance Metrics**: Track retrieval and inference times for optimization
+- **Multi-format Document Support**: Extract charts from PDF, DOCX, and PPTX files
+- **Multi-chart Type Support**: Handle Bar, Pie, Scatter, and Line charts
+- **Semantic Search**: Retrieve relevant charts using natural language queries via RAG
+- **Agentic Q&A**: Answer questions about chart data using ReAct reasoning pattern
+- **Chart Reconstruction**: Regenerate charts from extracted data with LLM-powered fallback
+- **Role-Based Access**: Support for user, tester, and admin roles
+- **Performance Metrics**: Track retrieval and inference times for optimization
 
 ---
 
