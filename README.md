@@ -66,7 +66,6 @@ streamlit run test.py
 
 ### Core Components
 
-```
 Document Upload
     ↓
 Chart Extraction (chart_extractor2.py)
@@ -78,7 +77,6 @@ Semantic Search (test.py → FAISS)
 Agentic Reasoning (practice2.py → Ollama)
     ↓
 Answer + Chart Display
-```
 
 ### Key Modules
 
@@ -175,7 +173,7 @@ ___
 - [LangChain Documentation](https://python.langchain.com)
 - [FAISS Documentation](https://faiss.ai)
 - [Sentence-Transformers](https://www.sbert.net)
-- [Pix2Struct Model](https://huggingface.co/google/pix2struct-base)
+- [Pix2Struct Deplot Model](https://huggingface.co/google/deplot)
 - [Streamlit Documentation](https://docs.streamlit.io)
 
 ___
