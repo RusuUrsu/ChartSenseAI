@@ -101,9 +101,6 @@ Answer + Chart Display
 - **FAISS**: Semantic similarity search and vector database
 - **Sentence-Transformers (all-MiniLM-L6-v2)**: Text embeddings for semantic search
 - **Pix2Struct**: Vision-to-text model for generating structured string from a chart image
-
-```
-
 ___
 ## Workflow
 
@@ -182,4 +179,3 @@ ___
 - [Streamlit Documentation](https://docs.streamlit.io)
 
 ___
-```
