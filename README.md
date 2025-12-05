@@ -19,13 +19,14 @@
 
 ## Features
 
-- **Multi-format Document Support**: Extract charts from PDF, DOCX, and PPTX files
-- **Multi-chart Type Support**: Handle Bar, Pie, Scatter, and Line charts
+- **Multi-format Document Support**: Extract charts from PDF and DOCX files
+- **Multi-chart Type Support**: Handle Bar, Pie, Scatter, and Line charts, can be extended to handle more
 - **Semantic Search**: Retrieve relevant charts using natural language queries via RAG
 - **Agentic Q&A**: Answer questions about chart data using ReAct reasoning pattern
 - **Chart Reconstruction**: Regenerate charts from extracted data with LLM-powered fallback
 - **Role-Based Access**: Support for user, tester, and admin roles
 - **Performance Metrics**: Track retrieval and inference times for optimization
+- **Potential**: Can be easily extended to handle more chart types or statistical calculations.
 
 ---
 
@@ -138,14 +139,7 @@ ___
 
 ___
 
-## Performance Considerations
-
-- **CPU Inference**: Optimized for CPU-only machines (~8GB RAM)
-- **Quantized Models**: Uses GGML quantization for reduced memory footprint
-- **Vector Search**: FAISS enables fast similarity search even with large chart collections
-- **Caching**: Vectorstore is persisted to avoid rebuilding on each run
-
-### Typical Performance
+### Typical Performance (CPU Inference)
 - Document processing: 2-5 minutes (depends on file size)
 - Chart question answering: 3-30 seconds
 - Chart reconstruction: 2-5 seconds
@@ -163,6 +157,10 @@ ___
 - Ensure document contains readable charts
 - Check extracted_images folder for extraction results
 - Try rephrasing the query
+
+### Issue: Chart Type not detected
+- Ensure you enter valid Nyckel API credentials in .env file
+- Get free credentials by creating an account on https://www.nyckel.com/
 
 ___
 
